@@ -5,17 +5,18 @@ extern crate crates_io;
 
 use std::path::Path;
 use std::cell::RefCell;
-use std::{env, str};
+use std::str;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::process::Command;
 use std::default::Default;
 use std::sync::mpsc::channel;
+use std::marker::PhantomData;
 
 
 use thread_scoped::scoped;
 
-use cargo::ops::{self, CompileOptions};
+use cargo::ops::{self, ExecEngine, CompileOptions, CompileFilter, CompileMode};
 use cargo::core::package::Package;
 use cargo::util::config::Config;
 use cargo::core::source::SourceId;
@@ -62,8 +63,62 @@ macro_rules! error {
     ($window:expr, $($tt:tt)*) => (error($window, &format!($($tt)*)))
 }
 
+pub struct Options<'a, F> where F: Fn() -> CompileFilter<'a> + 'a {
+    pub config: Config,
+    pub jobs: Option<u32>,
+    pub target: Option<String>,
+    pub features: Vec<String>,
+    pub no_default_features: bool,
+    pub spec: Vec<String>,
+    pub filter: F,
+    pub exec_engine: Option<Arc<Box<ExecEngine>>>,
+    pub release: bool,
+    pub mode: CompileMode,
+    pub target_rustdoc_args: Option<Vec<String>>,
+    pub target_rustc_args: Option<Vec<String>>,
+    data: PhantomData<& 'a ()>
+}
+impl<'a, F> Options<'a, F> where F: Fn() -> CompileFilter<'a> + 'a {
+    pub fn new(filter: F) -> Options<'a, F> where F: Fn() -> CompileFilter<'a> + 'a {
+        Options {
+            jobs: Some(8),
+            features: Vec::new(),
+            spec: Vec::new(),
+            config: Config::default().unwrap(),
+            exec_engine: None,
+            release: false,
+            filter: filter,
+            no_default_features: false,
+            target: None,
+            target_rustdoc_args: None,
+            target_rustc_args: None,
+            mode: CompileMode::Build,
+            data: PhantomData
+        }
+    }
+}
+impl<'a, F> Into<CompileOptions<'a>> for &'a Options<'a, F> where F: Fn() -> CompileFilter<'a> + 'a {
+    fn into(self) -> CompileOptions<'a> {
+        CompileOptions {
+            config: &self.config,
+            jobs: self.jobs,
+            target: self.target.as_ref().map(|v| v as &str),
+            features: &self.features,
+            no_default_features: self.no_default_features,
+            spec: &self.spec,
+            filter: (self.filter)(),
+            exec_engine: self.exec_engine.clone(),
+            release: self.release,
+            mode: self.mode,
+            target_rustdoc_args: self.target_rustdoc_args.as_ref().map(|v| v as &[String]),
+            target_rustc_args: self.target_rustc_args.as_ref().map(|v| v as &[String])
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct Context {
+    pub config: Rc<Config>,
     pub window: Window,
     pub file: FileChooser,
     pub build: Button,
@@ -102,6 +157,7 @@ impl Context {
         packs.append_column(&make_column("Description", "text", 1));
         packs.append_column(&make_column("Version", "text", 2));
         Context {
+            config: Rc::new(Config::default().unwrap()),
             window: builder.get_object("window").unwrap(),
             file: builder.get_object("file").unwrap(),
             build: builder.get_object("build").unwrap(),
@@ -134,7 +190,7 @@ impl Context {
     }
     fn update(&self) {
         if let Some(name) = self.file.get_filename() {
-            match Package::for_path(&name, &Config::default().unwrap()){
+            match Package::for_path(&name, &*self.config){
                 Ok(pack) => {
                     let meta = pack.manifest().metadata();
                     update_labels(&[
@@ -149,12 +205,6 @@ impl Context {
             }
         }
     }
-    fn compile_options(&self) -> CompileOptions {
-        CompileOptions {
-            jobs: Some(8),
-            
-        }
-    }
     fn bind_listeners(&self) {
         self.online_packages.set_model(Some(&self.store));
         let packs = self.online_packages.clone();
@@ -163,6 +213,8 @@ impl Context {
         let packs2 = self.online_packages.clone();
         let (tx, rx) = channel();
         let thread = RefCell::new(None);
+        let file = self.file.clone();
+
 
         self.online_search.connect_activate(move |entry| {
             let query = entry.get_text().unwrap_or_else(|| "".to_string());
@@ -174,16 +226,33 @@ impl Context {
                 tx.send(registry.search(&query, 64).map_err(|_| "Search failed").unwrap().0).unwrap();
             })});
         });
+        let window = self.window.clone();
+        let config2 = self.config.clone();
         self.install.connect_clicked(move |_| {
             let index = packs2.get_cursor().0.unwrap().get_indices()[0];
             let results = results.borrow();
-            let config = Config::default();
-            let id = SourceId::for_central(&config).unwrap();
-            ops::install(None, Some(&results[index].name), &id, None);
+            let id = SourceId::for_central(&*config2).unwrap();
+            let options = Options::new(|| CompileFilter::Everything);
+            let options: CompileOptions = (&options).into();
+            let name = &results[index as usize].name;
+            if let Err(err) = ops::install(None, Some(name), &id, None, &options) {
+                error!(Some(&window), "Failed to install '{}': {:?}", name, err);
+            }
+        });
+        let window2 = self.window.clone();
+        self.run.connect_clicked(move |_| {
+            if let Some(file) = file.get_filename() {
+                let options = Options::new(|| CompileFilter::Everything);
+                let options: CompileOptions = (&options).into();
+                if let Err(err) = ops::run(&file, &options, &[]) {
+                    error!(Some(&window2), "Failed to run '{:?}': {:?}", file, err);
+                }
+            }
         });
         let window = self.window.clone();
+        let config3 = self.config.clone();
         self.bind_button("publish", &self.publish, move |path| {
-            let package = Package::for_path(&path, &Config::default().unwrap()).unwrap();
+            let package = Package::for_path(&path, &*config3).unwrap();
             if !package.publish() {
                 error(Some(&window), "Failed to publish crate");
             }

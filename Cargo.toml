@@ -3,6 +3,7 @@ name = "cargo-manager"
 version = "0.1.0"
 authors = ["Tom Bebbington <tophattedcoder@gmail.com>"]
 description = "A GTK+ 3 interface for the Cargo package manager"
+license = "Apache"
 
 [dependencies]
 cargo = "*"

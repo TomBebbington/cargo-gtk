@@ -26,7 +26,6 @@ use std::sync::{Arc, Mutex};
 use std::process::Command;
 use std::default::Default;
 use std::sync::mpsc::channel;
-use std::marker::PhantomData;
 
 
 use thread_scoped::scoped;
@@ -39,7 +38,7 @@ use cargo::core::source::SourceId;
 use crates_io::{Crate, Registry};
 
 use gtk::prelude::*;
-use gtk::{DIALOG_DESTROY_WITH_PARENT, DIALOG_MODAL, ButtonsType, Label, Builder, MessageType, MessageDialog, CellRendererText, FileChooser, TreeView, Button, ListStore, TreeViewColumn, Window, SearchEntry};
+use gtk::{DIALOG_DESTROY_WITH_PARENT, DIALOG_MODAL, SpinButton, Dialog, ButtonsType, Label, Builder, MessageType, MessageDialog, CellRendererText, FileChooser, TreeView, Button, ListStore, TreeViewColumn, Window, SearchEntry};
 
 fn make_column(title: &str, kind: &str, id: i32) -> TreeViewColumn {
     let column = TreeViewColumn::new();
@@ -142,6 +141,45 @@ impl<'a> Into<CompileOptions<'a>> for &'a Options {
 }
 
 #[derive(Clone)]
+pub struct OptionsContext {
+    pub options: Rc<RefCell<Options>>,
+    pub dialog: Dialog,
+    pub jobs: SpinButton,
+    pub ok: Button,
+    pub cancel: Button
+}
+impl OptionsContext {
+    fn new(options: Rc<RefCell<Options>>) -> OptionsContext {
+        let builder = Builder::new_from_string(include_str!("compile.glade"));
+        let this = OptionsContext {
+            options: options,
+            dialog: builder.get_object("dialog").unwrap(),
+            jobs: builder.get_object("jobs").unwrap(),
+            ok: builder.get_object("ok").unwrap(),
+            cancel: builder.get_object("cancel").unwrap(),
+        };
+        this.bind_listeners();
+        this.dialog.show_all();
+        this
+    }
+    fn save(&self) {
+        let mut options = self.options.borrow_mut();
+        options.jobs = Some(self.jobs.get_value_as_int() as u32);
+    }
+    fn bind_listeners(&self) {
+        let self2 = self.clone();
+        self.ok.connect_clicked(move |_| {
+            self2.save();
+            self2.dialog.destroy();
+        });
+        let self3 = self.clone();
+        self.cancel.connect_clicked(move |_| {
+            self3.dialog.destroy();
+        });
+    }
+}
+
+#[derive(Clone)]
 pub struct Context {
     pub config: Rc<Config>,
     pub window: Window,
@@ -161,7 +199,8 @@ pub struct Context {
     pub local_description: Label,
     pub online_search: SearchEntry,
     pub online_packages: TreeView,
-    pub options: Rc<Options>
+    pub configure_compile: Button,
+    pub options: Rc<RefCell<Options>>
 }
 
 fn update_labels(labels: &[(&Label, &str)]) {
@@ -184,7 +223,7 @@ impl Context {
         packs.append_column(&make_column("Version", "text", 2));
         Context {
             config: Rc::new(Config::default().unwrap()),
-            options: Rc::new(Options::default()),
+            options: Rc::new(RefCell::new(Options::default())),
             window: builder.get_object("window").unwrap(),
             file: builder.get_object("file").unwrap(),
             build: builder.get_object("build").unwrap(),
@@ -196,6 +235,7 @@ impl Context {
             test: builder.get_object("test").unwrap(),
             doc: builder.get_object("doc").unwrap(),
             install: builder.get_object("install").unwrap(),
+            configure_compile: builder.get_object("configure-compile").unwrap(),
             local_name: builder.get_object("local_name").unwrap(),
             local_version: builder.get_object("local_version").unwrap(),
             local_author: builder.get_object("local_author").unwrap(),
@@ -210,6 +250,7 @@ impl Context {
         let options = self.options.clone();
         button.connect_clicked(move |_| {
             if let Some(file) = file.get_filename() {
+                let options = options.borrow();
                 let mut options: CompileOptions = (&*options).into();
                 mods(&mut options);
                 if let Err(err) = ops::compile(&file, &options) {
@@ -258,6 +299,10 @@ impl Context {
         self.bind_button("build", &self.build, |_| {});
         self.bind_button("test", &self.test, |mut c| c.mode = CompileMode::Test);
         self.bind_button("bench", &self.bench, |mut c| c.mode = CompileMode::Bench);
+        let options = self.options.clone();
+        self.configure_compile.connect_clicked(move |_| {
+            let _ = OptionsContext::new(options.clone());
+        });
         let window = self.window.clone();
         let config = self.config.clone();
         let options = self.options.clone();
@@ -265,6 +310,7 @@ impl Context {
             let index = packs2.get_cursor().0.unwrap().get_indices()[0];
             let results = results.borrow();
             let id = SourceId::for_central(&*config).unwrap();
+            let options = options.borrow();
             let options: CompileOptions = (&*options).into();
             let name = &results[index as usize].name;
             if let Err(err) = ops::install(None, Some(name), &id, None, &options) {
@@ -276,6 +322,7 @@ impl Context {
         let options = self.options.clone();
         self.run.connect_clicked(move |_| {
             if let Some(file) = file.get_filename() {
+                let options = options.borrow();
                 let options: CompileOptions = (&*options).into();
                 if let Err(err) = ops::run(&file, &options, &[]) {
                     error!(Some(&window), "Failed to run '{:?}': {:?}", file, err);

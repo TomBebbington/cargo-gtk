@@ -23,7 +23,6 @@ use std::cell::RefCell;
 use std::str;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
-use std::process::Command;
 use std::default::Default;
 use std::sync::mpsc::channel;
 
@@ -50,16 +49,6 @@ fn make_column(title: &str, kind: &str, id: i32) -> TreeViewColumn {
     column.set_sort_column_id(id);
     column
 }
-fn show_console(cwd: &Path, cmdn: &str) {
-    let mut cmd = Command::new("gnome-terminal");
-    cmd.current_dir(cwd);
-    cmd.arg("-x");
-    cmd.arg("bash");
-    cmd.arg("-c");
-    cmd.arg(cmdn);
-    println!("{:?}", cmd);
-    cmd.spawn().unwrap();
-}
 
 fn dialog(parent: Option<&Window>, ty: MessageType, text: &str) {
     let dialog = MessageDialog::new(parent, DIALOG_DESTROY_WITH_PARENT | DIALOG_MODAL, ty, ButtonsType::Close, text);
@@ -78,6 +67,15 @@ fn error(parent: Option<&Window>, text: &str) {
 }
 fn info(parent: Option<&Window>, text: &str) {
     dialog(parent, MessageType::Info, text)
+}
+
+fn bind_file_button<F>(file: &FileChooser, button: &Button, f: F) where F: Fn(&Path) + 'static {
+    let file = file.clone();
+    button.connect_clicked(move |_| {
+        if let Some(file) = file.get_filename() {
+            f(&file);
+        }
+    });
 }
 
 macro_rules! error {
@@ -264,20 +262,17 @@ impl Context {
             package_new: builder.get_object("package-new").unwrap()
         }
     }
-    fn bind_compile_button<F>(&self, name: &'static str, button: &Button, mods: F) where F: Fn(&mut CompileOptions) + 'static {
-        let file = self.file.clone();
+    fn bind_compile_button(&self, name: &'static str, button: &Button, mode: CompileMode) {
         let window = self.window.clone();
         let options = self.options.clone();
-        button.connect_clicked(move |_| {
-            if let Some(file) = file.get_filename() {
-                let options = options.borrow();
-                let mut options: CompileOptions = (&*options).into();
-                mods(&mut options);
-                if let Err(err) = ops::compile(&file, &options) {
-                    error!(Some(&window), "Failed to run '{}' subcommand due to '{:?}': {:?}", name, file, err);
-                } else {
-                    info!(Some(&window), "Successfully ran subcommand '{}'", name);
-                }
+        bind_file_button(&self.file, button, move |file| {
+            let options = options.borrow();
+            let mut options: CompileOptions = (&*options).into();
+            options.mode = mode;
+            if let Err(err) = ops::compile(&file, &options) {
+                error!(Some(&window), "Failed to run '{}' subcommand due to '{:?}': {:?}", name, file, err);
+            } else {
+                info!(Some(&window), "Successfully ran subcommand '{}'", name);
             }
         });
     }
@@ -318,9 +313,10 @@ impl Context {
                 tx.send(registry.search(&query, 64).map_err(|_| "Search failed").unwrap().0).unwrap();
             })});
         });
-        self.bind_compile_button("build", &self.build, |_| {});
-        self.bind_compile_button("test", &self.test, |mut c| c.mode = CompileMode::Test);
-        self.bind_compile_button("bench", &self.bench, |mut c| c.mode = CompileMode::Bench);
+        self.bind_compile_button("build", &self.build, CompileMode::Build);
+        self.bind_compile_button("test", &self.test, CompileMode::Test);
+        self.bind_compile_button("bench", &self.bench, CompileMode::Bench);
+        self.bind_compile_button("doc", &self.doc, CompileMode::Doc { deps: true });
         let options = self.options.clone();
         self.configure_compile.connect_clicked(move |_| {
             let _ = OptionsContext::new(options.clone());
@@ -342,55 +338,46 @@ impl Context {
             }
         });
         let window = self.window.clone();
-        let file = self.file.clone();
         let options = self.options.clone();
-        self.run.connect_clicked(move |_| {
-            if let Some(file) = file.get_filename() {
-                let options = options.borrow();
-                let options: CompileOptions = (&*options).into();
-                if let Err(err) = ops::run(&file, &options, &[]) {
-                    error!(Some(&window), "Failed to run '{:?}': {:?}", file, err);
-                }
+        bind_file_button(&self.file, &self.run, move |file| {
+            let options = options.borrow();
+            let options: CompileOptions = (&*options).into();
+            if let Err(err) = ops::run(&file, &options, &[]) {
+                error!(Some(&window), "Failed to run '{:?}': {:?}", file, err);
             }
         });
         let window = self.window.clone();
-        let file = self.file.clone();
         let config = self.config.clone();
-        self.publish.connect_clicked(move |_| {
-            if let Some(file) = file.get_filename() {
-                let package = Package::for_path(&file, &*config).unwrap();
-                if package.publish() {
-                    info(Some(&window), "Crate successfully published")
-                } else {
-                    error(Some(&window), "Failed to publish crate");
-                }
+        bind_file_button(&self.file, &self.publish, move |file| {
+            let package = Package::for_path(&file, &*config).unwrap();
+            if package.publish() {
+                info(Some(&window), "Crate successfully published")
+            } else {
+                error(Some(&window), "Failed to publish crate");
             }
         });
-        let file = self.package_file.clone();
         let package_name = self.package_name.clone();
         let package_type = self.package_type.clone();
         let package_vcs = self.package_vcs.clone();
         let window = self.window.clone();
         let options = self.options.clone();
-        self.package_new.connect_clicked(move |_| {
-            if let Some(file) = file.get_filename() {
-                let text = package_name.get_text();
-                let opts = NewOptions {
-                    path: file.to_str().unwrap(),
-                    name: text.as_ref().map(String::as_str),
-                    bin: package_type.get_active_id().as_ref().map(String::as_str) == Some("bin"),
-                    version_control: package_vcs.get_active_id().as_ref().map(String::as_str).map(|v| match v {
-                        "git" => VersionControl::Git,
-                        "mercurial" => VersionControl::Hg,
-                        _ => VersionControl::NoVcs
-                    })
-                };
-                let options = options.borrow();
-                if ops::init(opts, &options.config).is_ok() {
-                    info(Some(&window), "Created crate successfully");
-                } else {
-                    error(Some(&window), "Failed to create crate");
-                }
+        bind_file_button(&self.package_file, &self.package_new, move |file| {
+            let text = package_name.get_text();
+            let opts = NewOptions {
+                path: file.to_str().unwrap(),
+                name: text.as_ref().map(String::as_str),
+                bin: package_type.get_active_id().as_ref().map(String::as_str) == Some("bin"),
+                version_control: package_vcs.get_active_id().as_ref().map(String::as_str).map(|v| match v {
+                    "git" => VersionControl::Git,
+                    "mercurial" => VersionControl::Hg,
+                    _ => VersionControl::NoVcs
+                })
+            };
+            let options = options.borrow();
+            if ops::init(opts, &options.config).is_ok() {
+                info(Some(&window), "Created crate successfully");
+            } else {
+                error(Some(&window), "Failed to create crate");
             }
         });
         let self2 = self.clone();

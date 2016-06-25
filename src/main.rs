@@ -264,7 +264,7 @@ impl Context {
             package_new: builder.get_object("package-new").unwrap()
         }
     }
-    fn bind_button<F>(&self, name: &'static str, button: &Button, mods: F) where F: Fn(&mut CompileOptions) + 'static {
+    fn bind_compile_button<F>(&self, name: &'static str, button: &Button, mods: F) where F: Fn(&mut CompileOptions) + 'static {
         let file = self.file.clone();
         let window = self.window.clone();
         let options = self.options.clone();
@@ -318,9 +318,9 @@ impl Context {
                 tx.send(registry.search(&query, 64).map_err(|_| "Search failed").unwrap().0).unwrap();
             })});
         });
-        self.bind_button("build", &self.build, |_| {});
-        self.bind_button("test", &self.test, |mut c| c.mode = CompileMode::Test);
-        self.bind_button("bench", &self.bench, |mut c| c.mode = CompileMode::Bench);
+        self.bind_compile_button("build", &self.build, |_| {});
+        self.bind_compile_button("test", &self.test, |mut c| c.mode = CompileMode::Test);
+        self.bind_compile_button("bench", &self.bench, |mut c| c.mode = CompileMode::Bench);
         let options = self.options.clone();
         self.configure_compile.connect_clicked(move |_| {
             let _ = OptionsContext::new(options.clone());
@@ -337,6 +337,8 @@ impl Context {
             let name = &results[index as usize].name;
             if let Err(err) = ops::install(None, Some(name), &id, None, &options) {
                 error!(Some(&window), "Failed to install '{}': {:?}", name, err);
+            } else {
+                info!(Some(&window), "Crate '{}' successfully installed", name);
             }
         });
         let window = self.window.clone();

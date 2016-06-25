@@ -24,6 +24,14 @@ macro_rules! error {
 macro_rules! info {
     ($window:expr, $($tt:tt)*) => (::info($window, &format!($($tt)*)))
 }
+
+
+macro_rules! op {
+    ($window:expr, $op:expr, ($($tt:tt)*), $($ts:tt)*) => (
+        use std::borrow::Cow;
+        ::util::op($window, $op, || Cow::Owned(format!($($tt)*)), |err| Cow::Owned(format!($($ts)*, err)))
+    )
+}
 mod util;
 mod pages;
 

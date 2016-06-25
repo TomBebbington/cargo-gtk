@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::cell::RefCell;
 use std::sync::Arc;
 use std::rc::Rc;
@@ -7,6 +8,13 @@ use cargo::ops::{ExecEngine, CompileOptions, CompileFilter, CompileMode};
 
 use gtk::{Window, Builder};
 
+pub fn op<'a, T, E, Info, Error>(window: &Window, op: Result<T, E>, info: Info, error: Error) where Info:FnOnce() -> Cow<'a, str>, Error: FnOnce(E) -> Cow<'a, str> {
+    if let Err(err) = op {
+        ::error(Some(window), error(err).as_ref());
+    } else {
+        ::info(Some(window), info().as_ref());
+    }
+}
 #[derive(Clone)]
 pub struct PreContext {
     pub config: Rc<Config>,

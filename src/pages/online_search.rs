@@ -82,11 +82,12 @@ impl Page for OnlineSearchPage {
             let options = options.borrow();
             let options: CompileOptions = (&*options).into();
             let name = &results[index as usize].name;
-            if let Err(err) = ops::install(None, Some(name), &id, None, &options) {
-                error!(Some(&window), "Failed to install '{}': {:?}", name, err);
-            } else {
-                info!(Some(&window), "Crate '{}' successfully installed", name);
-            }
+            op!(
+                &window,
+                ops::install(None, Some(name), &id, None, &options),
+                ("Crate {:?} installed successfully", name),
+                "Failed to install crate due to {:?}"
+            );
         });
         let thread = RefCell::new(None);
         let sender = self.sender.clone();

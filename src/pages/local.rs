@@ -87,11 +87,13 @@ impl LocalPackagePage {
             let options = options.borrow();
             let mut options: CompileOptions = (&*options).into();
             options.mode = mode;
-            if let Err(err) = ops::compile(&file, &options) {
-                error!(Some(&window), "Failed to run '{}' subcommand due to '{:?}': {:?}", name, file, err);
-            } else {
-                info!(Some(&window), "Successfully ran subcommand '{}'", name);
-            }
+
+            op!(
+                &window,
+                ops::compile(&file, &options),
+                ("Successfully ran subcommand {}", name),
+                "Failed to create crate due to {:?}"
+            );
         });
     }
 }

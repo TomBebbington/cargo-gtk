@@ -30,7 +30,7 @@ use std::sync::mpsc::channel;
 
 use thread_scoped::scoped;
 
-use cargo::ops::{self, ExecEngine, CompileOptions, CompileFilter, CompileMode};
+use cargo::ops::{self, VersionControl, ExecEngine, CompileOptions, CompileFilter, CompileMode, NewOptions};
 use cargo::core::package::Package;
 use cargo::util::config::Config;
 use cargo::core::source::SourceId;
@@ -38,7 +38,7 @@ use cargo::core::source::SourceId;
 use crates_io::{Crate, Registry};
 
 use gtk::prelude::*;
-use gtk::{DIALOG_DESTROY_WITH_PARENT, DIALOG_MODAL, SpinButton, Dialog, ButtonsType, Label, Builder, MessageType, MessageDialog, CellRendererText, FileChooser, TreeView, Button, ListStore, TreeViewColumn, Window, SearchEntry};
+use gtk::{DIALOG_DESTROY_WITH_PARENT, DIALOG_MODAL, Entry, ComboBoxText,SpinButton, Dialog, ButtonsType, Label, Builder, MessageType, MessageDialog, CellRendererText, FileChooser, TreeView, Button, ListStore, TreeViewColumn, Window, SearchEntry};
 
 fn make_column(title: &str, kind: &str, id: i32) -> TreeViewColumn {
     let column = TreeViewColumn::new();
@@ -61,8 +61,8 @@ fn show_console(cwd: &Path, cmdn: &str) {
     cmd.spawn().unwrap();
 }
 
-fn error(parent: Option<&Window>, text: &str) {
-    let dialog = MessageDialog::new(parent, DIALOG_DESTROY_WITH_PARENT | DIALOG_MODAL, MessageType::Error, ButtonsType::Close, text);
+fn dialog(parent: Option<&Window>, ty: MessageType, text: &str) {
+    let dialog = MessageDialog::new(parent, DIALOG_DESTROY_WITH_PARENT | DIALOG_MODAL, ty, ButtonsType::Close, text);
     dialog.connect_response(|dialog, _| {
         dialog.destroy();
     });
@@ -73,8 +73,18 @@ fn error(parent: Option<&Window>, text: &str) {
     dialog.run();
 }
 
+fn error(parent: Option<&Window>, text: &str) {
+    dialog(parent, MessageType::Error, text)
+}
+fn info(parent: Option<&Window>, text: &str) {
+    dialog(parent, MessageType::Info, text)
+}
+
 macro_rules! error {
     ($window:expr, $($tt:tt)*) => (error($window, &format!($($tt)*)))
+}
+macro_rules! info {
+    ($window:expr, $($tt:tt)*) => (info($window, &format!($($tt)*)))
 }
 
 #[derive(Clone)]
@@ -200,6 +210,11 @@ pub struct Context {
     pub online_search: SearchEntry,
     pub online_packages: TreeView,
     pub configure_compile: Button,
+    pub package_file: FileChooser,
+    pub package_new: Button,
+    pub package_name: Entry,
+    pub package_type: ComboBoxText,
+    pub package_vcs: ComboBoxText,
     pub options: Rc<RefCell<Options>>
 }
 
@@ -241,7 +256,12 @@ impl Context {
             local_author: builder.get_object("local_author").unwrap(),
             local_description: builder.get_object("local_description").unwrap(),
             online_search: builder.get_object("online_search").unwrap(),
-            online_packages: packs
+            online_packages: packs,
+            package_file: builder.get_object("package-file").unwrap(),
+            package_name: builder.get_object("package-name").unwrap(),
+            package_vcs: builder.get_object("package-vcs").unwrap(),
+            package_type: builder.get_object("package-type").unwrap(),
+            package_new: builder.get_object("package-new").unwrap()
         }
     }
     fn bind_button<F>(&self, name: &'static str, button: &Button, mods: F) where F: Fn(&mut CompileOptions) + 'static {
@@ -254,7 +274,9 @@ impl Context {
                 let mut options: CompileOptions = (&*options).into();
                 mods(&mut options);
                 if let Err(err) = ops::compile(&file, &options) {
-                    error!(Some(&window), "Failed to {} '{:?}': {:?}", name, file, err);
+                    error!(Some(&window), "Failed to run '{}' subcommand due to '{:?}': {:?}", name, file, err);
+                } else {
+                    info!(Some(&window), "Successfully ran subcommand '{}'", name);
                 }
             }
         });
@@ -335,8 +357,37 @@ impl Context {
         self.publish.connect_clicked(move |_| {
             if let Some(file) = file.get_filename() {
                 let package = Package::for_path(&file, &*config).unwrap();
-                if !package.publish() {
+                if package.publish() {
+                    info(Some(&window), "Crate successfully published")
+                } else {
                     error(Some(&window), "Failed to publish crate");
+                }
+            }
+        });
+        let file = self.package_file.clone();
+        let package_name = self.package_name.clone();
+        let package_type = self.package_type.clone();
+        let package_vcs = self.package_vcs.clone();
+        let window = self.window.clone();
+        let options = self.options.clone();
+        self.package_new.connect_clicked(move |_| {
+            if let Some(file) = file.get_filename() {
+                let text = package_name.get_text();
+                let opts = NewOptions {
+                    path: file.to_str().unwrap(),
+                    name: text.as_ref().map(String::as_str),
+                    bin: package_type.get_active_id().as_ref().map(String::as_str) == Some("bin"),
+                    version_control: package_vcs.get_active_id().as_ref().map(String::as_str).map(|v| match v {
+                        "git" => VersionControl::Git,
+                        "mercurial" => VersionControl::Hg,
+                        _ => VersionControl::NoVcs
+                    })
+                };
+                let options = options.borrow();
+                if ops::init(opts, &options.config).is_ok() {
+                    info(Some(&window), "Created crate successfully");
+                } else {
+                    error(Some(&window), "Failed to create crate");
                 }
             }
         });

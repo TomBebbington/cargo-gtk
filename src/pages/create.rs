@@ -51,7 +51,7 @@ impl Page for NewPackagePage {
                     _ => VersionControl::NoVcs
                 })
             };
-            if ops::new(opts, &config).is_ok() {
+            if ops::init(opts, &config).is_ok() {
                 ::info(Some(&window), "Created crate successfully");
             } else {
                 ::error(Some(&window), "Failed to create crate");

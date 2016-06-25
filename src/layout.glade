@@ -13,7 +13,7 @@
     <property name="title" translatable="yes">Cargo Package Manager</property>
     <property name="icon_name">package-x-generic</property>
     <child>
-      <object class="GtkNotebook">
+      <object class="GtkNotebook" id="tabs">
         <property name="visible">True</property>
         <property name="can_focus">True</property>
         <child>
@@ -404,6 +404,7 @@
           </object>
           <packing>
             <property name="position">1</property>
+            <property name="tab_expand">True</property>
             <property name="tab_fill">False</property>
           </packing>
         </child>
@@ -536,6 +537,7 @@
           </object>
           <packing>
             <property name="position">2</property>
+            <property name="tab_expand">True</property>
             <property name="tab_fill">False</property>
           </packing>
         </child>

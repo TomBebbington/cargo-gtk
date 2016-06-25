@@ -24,7 +24,7 @@ use std::str;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::default::Default;
-use std::sync::mpsc::channel;
+use std::sync::mpsc::{channel, Sender, Receiver};
 
 
 use thread_scoped::scoped;
@@ -37,7 +37,7 @@ use cargo::core::source::SourceId;
 use crates_io::{Crate, Registry};
 
 use gtk::prelude::*;
-use gtk::{DIALOG_DESTROY_WITH_PARENT, DIALOG_MODAL, Entry, ComboBoxText,SpinButton, Dialog, ButtonsType, Label, Builder, MessageType, MessageDialog, CellRendererText, FileChooser, TreeView, Button, ListStore, TreeViewColumn, Window, SearchEntry};
+use gtk::{DIALOG_DESTROY_WITH_PARENT, DIALOG_MODAL, Notebook, Entry, ComboBoxText,SpinButton, Dialog, ButtonsType, Label, Builder, MessageType, MessageDialog, CellRendererText, FileChooser, TreeView, Button, ListStore, TreeViewColumn, Window, SearchEntry};
 
 fn make_column(title: &str, kind: &str, id: i32) -> TreeViewColumn {
     let column = TreeViewColumn::new();
@@ -187,8 +187,92 @@ impl OptionsContext {
     }
 }
 
+pub trait Page: Clone {
+    fn new(context: &PreContext) -> Self;
+    fn update(&self) {}
+    fn bind_listeners(&self) {}
+}
+
 #[derive(Clone)]
-pub struct Context {
+pub struct OnlineSearchPage {
+    pub config: Rc<Config>,
+    pub options: Rc<RefCell<Options>>,
+    pub window: Window,
+    pub search: SearchEntry,
+    pub store: ListStore,
+    pub packages: TreeView,
+    pub install: Button,
+    pub sender: Sender<Vec<Crate>>,
+    pub receiver: Rc<Receiver<Vec<Crate>>>,
+    results: Rc<RefCell<Vec<Crate>>>
+}
+impl Page for OnlineSearchPage {
+    fn new(c: &PreContext) -> Self {
+        let (tx, rx) = channel();
+        OnlineSearchPage {
+            config: c.config.clone(),
+            options: c.options.clone(),
+            window: c.window.clone(),
+            search: c.builder.get_object("online_search").unwrap(),
+            packages: c.builder.get_object("online_packages").unwrap(),
+            install: c.builder.get_object("install").unwrap(),
+            store: c.builder.get_object("store").unwrap(),
+            sender: tx,
+            receiver: Rc::new(rx),
+            results: Rc::new(RefCell::new(Vec::new()))
+        }
+    }
+    fn update(&self) {
+        if let Ok(crates) = self.receiver.try_recv() {
+            for old_result in self.packages.get_children() {
+                self.packages.remove(&old_result);
+            }
+            let mut results = self.results.borrow_mut();
+            *results = crates;
+            self.store.clear();
+            for c in &*results {
+                self.store.insert_with_values(None, &[0, 1, 2], &[&c.name, &c.description, &c.max_version]);
+            }
+            self.packages.show_all();
+        }
+    }
+    fn bind_listeners(&self) {
+        let results = self.results.clone();
+        let window = self.window.clone();
+        let config = self.config.clone();
+        let options = self.options.clone();
+        let packages = self.packages.clone();
+        self.install.connect_clicked(move |_| {
+            let index = packages.get_cursor().0.unwrap().get_indices()[0];
+            let results = results.borrow();
+            let id = SourceId::for_central(&*config).unwrap();
+            let options = options.borrow();
+            let options: CompileOptions = (&*options).into();
+            let name = &results[index as usize].name;
+            if let Err(err) = ops::install(None, Some(name), &id, None, &options) {
+                error!(Some(&window), "Failed to install '{}': {:?}", name, err);
+            } else {
+                info!(Some(&window), "Crate '{}' successfully installed", name);
+            }
+        });
+        let thread = RefCell::new(None);
+        let sender = self.sender.clone();
+        self.search.connect_activate(move |entry| {
+            let query = entry.get_text().unwrap_or_else(|| "".to_string());
+            let tx = Arc::new(Mutex::new(sender.clone()));
+            let mut thread = thread.borrow_mut();
+            *thread = Some(unsafe { scoped(move || {
+                let mut registry = get_registry();
+                let tx = tx.lock().unwrap();
+                tx.send(registry.search(&query, 64).map_err(|_| "Search failed").unwrap().0).unwrap();
+            })});
+        });
+    }
+}
+
+#[derive(Clone)]
+pub struct LocalPackagePage {
+    pub options: Rc<RefCell<Options>>,
     pub config: Rc<Config>,
     pub window: Window,
     pub file: FileChooser,
@@ -199,20 +283,145 @@ pub struct Context {
     pub update: Button,
     pub test: Button,
     pub doc: Button,
-    pub store: ListStore,
-    pub install: Button,
-    pub local_name: Label,
-    pub local_version: Label,
-    pub local_author: Label,
-    pub local_description: Label,
-    pub online_search: SearchEntry,
-    pub online_packages: TreeView,
-    pub configure_compile: Button,
-    pub package_file: FileChooser,
-    pub package_new: Button,
-    pub package_name: Entry,
-    pub package_type: ComboBoxText,
-    pub package_vcs: ComboBoxText,
+    pub name: Label,
+    pub version: Label,
+    pub author: Label,
+    pub description: Label,
+    pub configure_compile: Button
+}
+impl LocalPackagePage {
+    fn bind_compile_button(&self, name: &'static str, button: &Button, mode: CompileMode) {
+        let window = self.window.clone();
+        let options = self.options.clone();
+        bind_file_button(&self.file, button, move |file| {
+            let options = options.borrow();
+            let mut options: CompileOptions = (&*options).into();
+            options.mode = mode;
+            if let Err(err) = ops::compile(&file, &options) {
+                error!(Some(&window), "Failed to run '{}' subcommand due to '{:?}': {:?}", name, file, err);
+            } else {
+                info!(Some(&window), "Successfully ran subcommand '{}'", name);
+            }
+        });
+    }
+}
+impl Page for LocalPackagePage {
+    fn new(c: &PreContext) -> Self {
+        let b = &c.builder;
+        LocalPackagePage {
+            options: c.options.clone(),
+            config: c.config.clone(),
+            window: c.window.clone(),
+            file: b.get_object("file").unwrap(),
+            build: b.get_object("build").unwrap(),
+            run: b.get_object("run").unwrap(),
+            bench: b.get_object("bench").unwrap(),
+            publish: b.get_object("publish").unwrap(),
+            update: b.get_object("update").unwrap(),
+            test: b.get_object("test").unwrap(),
+            doc: b.get_object("doc").unwrap(),
+            configure_compile: b.get_object("configure-compile").unwrap(),
+            name: b.get_object("local_name").unwrap(),
+            version: b.get_object("local_version").unwrap(),
+            author: b.get_object("local_author").unwrap(),
+            description: b.get_object("local_description").unwrap(),
+        }
+    }
+    fn update(&self) {
+        if let Some(name) = self.file.get_filename() {
+            match Package::for_path(&name, &*self.config){
+                Ok(pack) => {
+                    let meta = pack.manifest().metadata();
+                    update_labels(&[
+                        (&self.name, pack.name()),
+                        (&self.description, meta.description.as_ref().map(|v| v as &str).unwrap_or("")),
+                        (&self.author, meta.authors.get(0).as_ref().map(|v| v as &str).unwrap_or("")),
+                        (&self.version, &pack.version().to_string())
+                    ]);
+                },
+                Err(error) =>
+                    error!(Some(&self.window), "Failed to parse Cargo.toml: {:?}", error)
+            }
+        }
+    }
+    fn bind_listeners(&self) {
+        self.bind_compile_button("build", &self.build, CompileMode::Build);
+        self.bind_compile_button("test", &self.test, CompileMode::Test);
+        self.bind_compile_button("bench", &self.bench, CompileMode::Bench);
+        self.bind_compile_button("doc", &self.doc, CompileMode::Doc { deps: true });
+        let options = self.options.clone();
+        self.configure_compile.connect_clicked(move |_| {
+            OptionsContext::new(options.clone());
+        });
+    }
+}
+#[derive(Clone)]
+pub struct NewPackagePage {
+    pub window: Window,
+    pub config: Rc<Config>,
+    pub file: FileChooser,
+    pub new: Button,
+    pub name: Entry,
+    pub ty: ComboBoxText,
+    pub vcs: ComboBoxText,
+}
+impl Page for NewPackagePage {
+    fn new(c: &PreContext) -> NewPackagePage {
+        let b = &c.builder;
+        NewPackagePage {
+            window: c.window.clone(),
+            config: c.config.clone(),
+            file: b.get_object("package-file").unwrap(),
+            name: b.get_object("package-name").unwrap(),
+            vcs: b.get_object("package-vcs").unwrap(),
+            ty: b.get_object("package-type").unwrap(),
+            new: b.get_object("package-new").unwrap()
+        }
+    }
+    fn bind_listeners(&self) {
+        let name = self.name.clone();
+        let ty = self.ty.clone();
+        let vcs = self.vcs.clone();
+        let window = self.window.clone();
+        let config = self.config.clone();
+        bind_file_button(&self.file, &self.new, move |file| {
+            let text = name.get_text();
+            let opts = NewOptions {
+                path: file.to_str().unwrap(),
+                name: text.as_ref().map(String::as_str),
+                bin: ty.get_active_id().as_ref().map(String::as_str) == Some("bin"),
+                version_control: vcs.get_active_id().as_ref().map(String::as_str).map(|v| match v {
+                    "git" => VersionControl::Git,
+                    "mercurial" => VersionControl::Hg,
+                    _ => VersionControl::NoVcs
+                })
+            };
+            if ops::init(opts, &config).is_ok() {
+                info(Some(&window), "Created crate successfully");
+            } else {
+                error(Some(&window), "Failed to create crate");
+            }
+        });
+    }
+}
+
+#[derive(Clone)]
+pub struct Context {
+    pub config: Rc<Config>,
+    pub builder: Builder,
+    pub window: Window,
+    pub tabs: Notebook,
+    pub online_packs: OnlineSearchPage,
+    pub local_pack: LocalPackagePage,
+    pub new_pack: NewPackagePage,
+    pub options: Rc<RefCell<Options>>
+}
+
+#[derive(Clone)]
+pub struct PreContext {
+    pub config: Rc<Config>,
+    pub builder: Builder,
+    pub window: Window,
     pub options: Rc<RefCell<Options>>
 }
 
@@ -230,178 +439,44 @@ impl Context {
     fn new() -> Context {
         let builder = Builder::new_from_string(include_str!("layout.glade"));
         let packs: TreeView = builder.get_object("online_packages").expect("Failed to load online_packages");
+        let store: ListStore = builder.get_object("store").unwrap();
         packs.set_headers_visible(true);
         packs.append_column(&make_column("Package", "text", 0));
         packs.append_column(&make_column("Description", "text", 1));
         packs.append_column(&make_column("Version", "text", 2));
-        Context {
-            config: Rc::new(Config::default().unwrap()),
-            options: Rc::new(RefCell::new(Options::default())),
+        packs.set_model(Some(&store));
+        let tabs = builder.get_object("tabs").unwrap();
+        let pre = PreContext {
             window: builder.get_object("window").unwrap(),
-            file: builder.get_object("file").unwrap(),
-            build: builder.get_object("build").unwrap(),
-            run: builder.get_object("run").unwrap(),
-            bench: builder.get_object("bench").unwrap(),
-            publish: builder.get_object("publish").unwrap(),
-            update: builder.get_object("update").unwrap(),
-            store: builder.get_object("store").unwrap(),
-            test: builder.get_object("test").unwrap(),
-            doc: builder.get_object("doc").unwrap(),
-            install: builder.get_object("install").unwrap(),
-            configure_compile: builder.get_object("configure-compile").unwrap(),
-            local_name: builder.get_object("local_name").unwrap(),
-            local_version: builder.get_object("local_version").unwrap(),
-            local_author: builder.get_object("local_author").unwrap(),
-            local_description: builder.get_object("local_description").unwrap(),
-            online_search: builder.get_object("online_search").unwrap(),
-            online_packages: packs,
-            package_file: builder.get_object("package-file").unwrap(),
-            package_name: builder.get_object("package-name").unwrap(),
-            package_vcs: builder.get_object("package-vcs").unwrap(),
-            package_type: builder.get_object("package-type").unwrap(),
-            package_new: builder.get_object("package-new").unwrap()
-        }
-    }
-    fn bind_compile_button(&self, name: &'static str, button: &Button, mode: CompileMode) {
-        let window = self.window.clone();
-        let options = self.options.clone();
-        bind_file_button(&self.file, button, move |file| {
-            let options = options.borrow();
-            let mut options: CompileOptions = (&*options).into();
-            options.mode = mode;
-            if let Err(err) = ops::compile(&file, &options) {
-                error!(Some(&window), "Failed to run '{}' subcommand due to '{:?}': {:?}", name, file, err);
-            } else {
-                info!(Some(&window), "Successfully ran subcommand '{}'", name);
-            }
-        });
-    }
-    fn update(&self) {
-        if let Some(name) = self.file.get_filename() {
-            match Package::for_path(&name, &*self.config){
-                Ok(pack) => {
-                    let meta = pack.manifest().metadata();
-                    update_labels(&[
-                        (&self.local_name, pack.name()),
-                        (&self.local_description, meta.description.as_ref().map(|v| v as &str).unwrap_or("")),
-                        (&self.local_author, meta.authors.get(0).as_ref().map(|v| v as &str).unwrap_or("")),
-                        (&self.local_version, &pack.version().to_string())
-                    ]);
-                },
-                Err(error) =>
-                    error!(Some(&self.window), "Failed to parse Cargo.toml: {:?}", error)
-            }
+            builder: builder,
+            config: Rc::new(Config::default().unwrap()),
+            options: Rc::new(RefCell::new(Options::default()))
+        };
+        let local_pack = LocalPackagePage::new(&pre);
+        let online_packs = OnlineSearchPage::new(&pre);
+        let new_pack = NewPackagePage::new(&pre);
+        Context {
+            window: pre.window,
+            builder: pre.builder,
+            config: pre.config,
+            options: pre.options,
+            tabs: tabs,
+            local_pack: local_pack,
+            online_packs: online_packs,
+            new_pack: new_pack
         }
     }
     fn bind_listeners(&self) {
-        self.online_packages.set_model(Some(&self.store));
-        let packs = self.online_packages.clone();
-        let results = Rc::new(RefCell::new(Vec::<Crate>::new()));
-        let results2 = results.clone();
-        let packs2 = self.online_packages.clone();
-        let (tx, rx) = channel();
-        let thread = RefCell::new(None);
-
-
-        self.online_search.connect_activate(move |entry| {
-            let query = entry.get_text().unwrap_or_else(|| "".to_string());
-            let tx = Arc::new(Mutex::new(tx.clone()));
-            let mut thread = thread.borrow_mut();
-            *thread = Some(unsafe { scoped(move || {
-                let mut registry = get_registry();
-                let tx = tx.lock().unwrap();
-                tx.send(registry.search(&query, 64).map_err(|_| "Search failed").unwrap().0).unwrap();
-            })});
-        });
-        self.bind_compile_button("build", &self.build, CompileMode::Build);
-        self.bind_compile_button("test", &self.test, CompileMode::Test);
-        self.bind_compile_button("bench", &self.bench, CompileMode::Bench);
-        self.bind_compile_button("doc", &self.doc, CompileMode::Doc { deps: true });
-        let options = self.options.clone();
-        self.configure_compile.connect_clicked(move |_| {
-            let _ = OptionsContext::new(options.clone());
-        });
-        let window = self.window.clone();
-        let config = self.config.clone();
-        let options = self.options.clone();
-        self.install.connect_clicked(move |_| {
-            let index = packs2.get_cursor().0.unwrap().get_indices()[0];
-            let results = results.borrow();
-            let id = SourceId::for_central(&*config).unwrap();
-            let options = options.borrow();
-            let options: CompileOptions = (&*options).into();
-            let name = &results[index as usize].name;
-            if let Err(err) = ops::install(None, Some(name), &id, None, &options) {
-                error!(Some(&window), "Failed to install '{}': {:?}", name, err);
-            } else {
-                info!(Some(&window), "Crate '{}' successfully installed", name);
-            }
-        });
-        let window = self.window.clone();
-        let options = self.options.clone();
-        bind_file_button(&self.file, &self.run, move |file| {
-            let options = options.borrow();
-            let options: CompileOptions = (&*options).into();
-            if let Err(err) = ops::run(&file, &options, &[]) {
-                error!(Some(&window), "Failed to run '{:?}': {:?}", file, err);
-            }
-        });
-        let window = self.window.clone();
-        let config = self.config.clone();
-        bind_file_button(&self.file, &self.publish, move |file| {
-            let package = Package::for_path(&file, &*config).unwrap();
-            if package.publish() {
-                info(Some(&window), "Crate successfully published")
-            } else {
-                error(Some(&window), "Failed to publish crate");
-            }
-        });
-        let package_name = self.package_name.clone();
-        let package_type = self.package_type.clone();
-        let package_vcs = self.package_vcs.clone();
-        let window = self.window.clone();
-        let options = self.options.clone();
-        bind_file_button(&self.package_file, &self.package_new, move |file| {
-            let text = package_name.get_text();
-            let opts = NewOptions {
-                path: file.to_str().unwrap(),
-                name: text.as_ref().map(String::as_str),
-                bin: package_type.get_active_id().as_ref().map(String::as_str) == Some("bin"),
-                version_control: package_vcs.get_active_id().as_ref().map(String::as_str).map(|v| match v {
-                    "git" => VersionControl::Git,
-                    "mercurial" => VersionControl::Hg,
-                    _ => VersionControl::NoVcs
-                })
-            };
-            let options = options.borrow();
-            if ops::init(opts, &options.config).is_ok() {
-                info(Some(&window), "Created crate successfully");
-            } else {
-                error(Some(&window), "Failed to create crate");
-            }
-        });
-        let self2 = self.clone();
-        let old_file = RefCell::new(self.file.get_filename());
-        let file = self.file.clone();
-        let store = self.store.clone();
+        self.online_packs.bind_listeners();
+        self.local_pack.bind_listeners();
+        self.new_pack.bind_listeners();
+        let online_packs = self.online_packs.clone();
+        let local_pack = self.local_pack.clone();
+        let new_pack = self.new_pack.clone();
         self.window.connect_draw(move |_, _| {
-            let mut old_file = old_file.borrow_mut();
-            if file.get_filename() != *old_file {
-                *old_file = file.get_filename();
-                self2.update();
-            }
-            if let Ok(crates) = rx.try_recv() {
-                for old_result in packs.get_children() {
-                    packs.remove(&old_result);
-                }
-                let mut results = results2.borrow_mut();
-                *results = crates;
-                store.clear();
-                for c in &*results {
-                    store.insert_with_values(None, &[0, 1, 2], &[&c.name, &c.description, &c.max_version]);
-                }
-                packs.show_all();
-            }
+            online_packs.update();
+            local_pack.update();
+            new_pack.update();
             Inhibit(false)
         });
         self.window.connect_delete_event(|_, _| {
